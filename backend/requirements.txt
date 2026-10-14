@@ -2,9 +2,12 @@ fastapi
 uvicorn[standard]
 sqlmodel
 psycopg[binary]
-pydantic
 pillow
 httpx
 crewai
 pytest
 alembic
+redis
+PyJWT
+bcrypt
+pydantic
