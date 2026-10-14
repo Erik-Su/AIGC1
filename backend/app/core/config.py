@@ -9,14 +9,6 @@ from dotenv import load_dotenv
 # 提取项目工程的根目录路径，拼接.env的路径并加载.env中的环境配置
 BASE_DIR = Path(__file__).resolve().parents[3]
 
-"""
-[
-    D:\AgentDev\code\backend\app\core 0
-    D:\AgentDev\code\backend\app      1
-    D:\AgentDev\code\backend          2
-    Path("D:\AgentDev\code\")         3
-]
-"""
 # 拼接路径
 ENV_FILE = BASE_DIR / ".env"
 load_dotenv(ENV_FILE, override=False)
@@ -49,5 +41,8 @@ class Settings(object):
     db_healthcheck_interval: str = field(default_factory=lambda: os.getenv("DB_HEALTHCHECK_INTERVAL", "10s"))
     db_healthcheck_timeout: str = field(default_factory=lambda: os.getenv("DB_HEALTHCHECK_TIMEOUT", "5s"))
     db_healthcheck_retries: int = field(default_factory=lambda: int(os.getenv("DB_HEALTHCHECK_RETRIES", "5")))
+
+    user_default_admin_name: str = field(default_factory=lambda: os.getenv("USER_DEFAULT_ADMIN_NAME", "admin"))
+    user_default_admin_password: str = field(default_factory=lambda: os.getenv("USER_DEFAULT_ADMIN_PASSWORD", "admin123"))
 
 settings = Settings()
