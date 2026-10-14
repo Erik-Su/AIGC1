@@ -62,10 +62,6 @@
           </el-button>
         </el-form>
 
-        <div class="footer">
-          default: <span>admin / admin123</span>
-        </div>
-
         <nav class="router-actions">
           <el-link type="primary" :underline="false" @click="goForgotPassword">
             忘记密码?
@@ -78,10 +74,11 @@
 
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
-import { useRouter, RouterLink } from 'vue-router'
+import { useRouter } from 'vue-router'
 import type { FormInstance, FormRules } from 'element-plus'
 import { ElMessage } from 'element-plus'
 import { Hide, View } from '@element-plus/icons-vue'
+import { loginApi } from '@/api/user'
 
 interface LoginForm {
   username: string
@@ -116,22 +113,26 @@ const handleLogin = async () => {
   loading.value = true
 
   try {
-    // 示例登录逻辑：按原页面默认账号 admin / admin123 校验。
-    // 接入真实接口时，可在这里替换为 await loginApi(loginForm)。
-    if (loginForm.username === 'admin' && loginForm.password === 'admin123') {
-      ElMessage.success('登录成功')
-      await router.push('/project')
-      return
-    }
+    const { data } = await loginApi({
+      username: loginForm.username.trim(),
+      password: loginForm.password,
+    })
 
-    ElMessage.error('用户名或密码错误')
+    localStorage.setItem('access_token', data.access_token)
+    localStorage.setItem('refresh_token', data.refresh_token)
+    localStorage.setItem('token_type', data.token_type)
+    localStorage.setItem('expires_in', String(data.expires_in))
+    localStorage.setItem('user', JSON.stringify(data.user))
+
+    ElMessage.success('登录成功')
+    await router.replace('/project')
   } finally {
     loading.value = false
   }
 }
 
 const goForgotPassword = () => {
-  router.push('/forgot-password')
+  ElMessage.info('请联系管理员重置密码')
 }
 </script>
 
@@ -281,17 +282,6 @@ const goForgotPassword = () => {
 .login-button:hover,
 .login-button:focus {
   background: #1d4ed8;
-}
-
-.footer {
-  margin-top: 14px;
-  font-size: 11px;
-  color: #8b949e;
-  text-align: center;
-}
-
-.footer span {
-  color: #f3d96b;
 }
 
 .router-actions {
