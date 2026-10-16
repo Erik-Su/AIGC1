@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+from typing import Any
+
+from app.core.base_provider import BaseProvider
+
+
+PROVIDER_CONFIG = {'key': 'deepseek',
+ 'protocol': 'openai',
+ 'version': '4.0',
+ 'name': 'deepseek',
+ 'description': 'Deepseek服务',
+ 'decs_url': 'https://api-docs.deepseek.com/zh-cn/',
+ 'icon': '',
+ 'inputs': [{'key': 'DEEPSEEK_API_KEY',
+             'label': 'DEEPSEEK_API_KEY',
+             'type': 'password',
+             'required': True}],
+ 'input_values': {'DEEPSEEK_API_KEY': 'enc:v1:4VoOhQ1Ned2aLA7aIxDqimsMLODcatons_BJxEUmHc_n8UPfX46fPgWoXpLVRGfqqSzye1oB8wfWR2FYQTrbbpimJw=='},
+ 'base_url': 'https://api.deepseek.com',
+ 'enabled': False,
+ 'sort_order': 1,
+ 'models': [{'name': 'DeepSeek-V4.1-Flash',
+             'model_id': 'deepseek-flash',
+             'model_type': 'text',
+             'description': 'deepseek',
+             'modes': ['text'],
+             'think': False,
+             'voices': [],
+             'audio': None,
+             'duration_resolution_map': [],
+             'raw_config': {'id': 'deepseek-flash',
+                            'object': 'model',
+                            'owned_by': 'deepseek',
+                            'name': 'DeepSeek-V4.1-Flash',
+                            'context_window': 1048576,
+                            'max_output_tokens': 393216,
+                            'input_modalities': ['text', 'image'],
+                            'output_modalities': ['text'],
+                            'effort': {'supported_levels': ['low', 'high', 'max'],
+                                       'default_level': 'high'},
+                            'api_capabilities': {'anthropic_messages': {'system_prompt_update': 'in-history'}}},
+             'aspect_ratios': [],
+             'sizes': [],
+             'fps': []},
+            {'name': 'DeepSeek-V4-Pro',
+             'model_id': 'deepseek-v4-pro',
+             'model_type': 'text',
+             'description': 'deepseek',
+             'modes': ['text'],
+             'think': False,
+             'voices': [],
+             'audio': None,
+             'duration_resolution_map': [],
+             'raw_config': {'id': 'deepseek-v4-pro',
+                            'object': 'model',
+                            'owned_by': 'deepseek',
+                            'name': 'DeepSeek-V4-Pro',
+                            'context_window': 1048576,
+                            'max_output_tokens': 393216,
+                            'input_modalities': ['text'],
+                            'output_modalities': ['text'],
+                            'effort': {'supported_levels': ['low', 'high', 'max'],
+                                       'default_level': 'high'},
+                            'api_capabilities': {'anthropic_messages': {'system_prompt_update': 'leading-only'}}},
+             'aspect_ratios': [],
+             'sizes': [],
+             'fps': []}],
+ 'url': 'https://www.deepseek.com/en/'}
+
+
+class Text(BaseProvider):
+    provider_key = PROVIDER_CONFIG["key"]
+    provider_config = PROVIDER_CONFIG
+    model_type = "text"
+
+    async def generate(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        return await self.generate_text(model_id=model_id, **kwargs)
+
+    async def generate_text(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        raise NotImplementedError("请实现当前服务的文本生成逻辑")
+
+
+class Image(BaseProvider):
+    provider_key = PROVIDER_CONFIG["key"]
+    provider_config = PROVIDER_CONFIG
+    model_type = "image"
+
+    async def generate(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        return await self.generate_image(model_id=model_id, **kwargs)
+
+    async def generate_image(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        raise NotImplementedError("请实现当前服务的图像生成逻辑")
+
+
+class Video(BaseProvider):
+    provider_key = PROVIDER_CONFIG["key"]
+    provider_config = PROVIDER_CONFIG
+    model_type = "video"
+
+    async def generate(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        return await self.generate_video(model_id=model_id, **kwargs)
+
+    async def generate_video(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        raise NotImplementedError("请实现当前服务的视频生成逻辑")
+
+
+class TTS(BaseProvider):
+    provider_key = PROVIDER_CONFIG["key"]
+    provider_config = PROVIDER_CONFIG
+    model_type = "tts"
+
+    async def generate(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        return await self.generate_tts(model_id=model_id, **kwargs)
+
+    async def generate_tts(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        raise NotImplementedError("请实现当前服务的语音生成逻辑")

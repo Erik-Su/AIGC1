@@ -54,7 +54,7 @@ async def jwt_auth_middleware(
         )
 
     try:
-        payload = await decode_token(credentials.credentials, refresh_access_ttl=True)
+        payload = await decode_token(credentials.credentials)
     except (jwt.PyJWTError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

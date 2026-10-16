@@ -314,3 +314,109 @@ class TestUserLogin(EnvTestBase):
             await database.engine.dispose()
 
         assert response.status_code == 401
+
+    async def _login(self, client: AsyncClient) -> dict:
+        """以固定账号登录并返回响应体。"""
+        response = await client.post(
+            "/api/users/login",
+            json={"username": "moluo", "password": "password123"},
+        )
+        return response.json()
+
+    @pytest.mark.anyio
+    async def test_refresh_token_returns_usable_access_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        database, app, user_service = await self._prepare(monkeypatch, tmp_path)
+        transport = ASGITransport(app=app)
+        try:
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                await self._create_user(database, user_service, "moluo", "password123")
+                login_body = await self._login(client)
+                refresh_response = await client.post(
+                    "/api/users/refresh-token",
+                    json={"refresh_token": login_body["refresh_token"]},
+                )
+                new_access_token = refresh_response.json().get("access_token", "")
+                me_response = await client.get(
+                    "/api/users/me",
+                    headers={"Authorization": f"Bearer {new_access_token}"},
+                )
+        finally:
+            await database.drop_db_and_tables()
+            await database.engine.dispose()
+
+        assert refresh_response.status_code == 200
+        body = refresh_response.json()
+        assert body["token_type"] == "bearer"
+        assert body["access_token"] != login_body["access_token"]
+        assert body["expires_in"] == config_module.settings.access_token_expire_seconds
+        assert me_response.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_refresh_token_rejects_access_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        database, app, user_service = await self._prepare(monkeypatch, tmp_path)
+        transport = ASGITransport(app=app)
+        try:
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                await self._create_user(database, user_service, "moluo", "password123")
+                login_body = await self._login(client)
+                response = await client.post(
+                    "/api/users/refresh-token",
+                    json={"refresh_token": login_body["access_token"]},
+                )
+        finally:
+            await database.drop_db_and_tables()
+            await database.engine.dispose()
+
+        assert response.status_code == 401
+
+    @pytest.mark.anyio
+    async def test_refresh_token_rejects_garbage_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        database, app, _ = await self._prepare(monkeypatch, tmp_path)
+        transport = ASGITransport(app=app)
+        try:
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.post(
+                    "/api/users/refresh-token",
+                    json={"refresh_token": "not-a-jwt"},
+                )
+        finally:
+            await database.drop_db_and_tables()
+            await database.engine.dispose()
+
+        assert response.status_code == 401
+
+    @pytest.mark.anyio
+    async def test_refresh_token_rejects_disabled_user(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        database, app, user_service = await self._prepare(monkeypatch, tmp_path)
+        transport = ASGITransport(app=app)
+        try:
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                created = await self._create_user(database, user_service, "moluo", "password123")
+                login_body = await self._login(client)
+                async with database.async_session_maker() as session:
+                    await user_service.disable_user(session, created["public_id"])
+                response = await client.post(
+                    "/api/users/refresh-token",
+                    json={"refresh_token": login_body["refresh_token"]},
+                )
+        finally:
+            await database.drop_db_and_tables()
+            await database.engine.dispose()
+
+        assert response.status_code == 401

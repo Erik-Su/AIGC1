@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
+import jwt
 from fastapi import Depends, File, HTTPException, Request, Response, UploadFile, status
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -16,8 +17,14 @@ from app.schemas.user import (
     UserUpdate,
 )
 from app.services import user as user_service
-from app.schemas.user import LoginUserInfo, UserLogin, UserLoginResponse
-from app.utils.jwt_tools import create_login_tokens
+from app.schemas.user import (
+    LoginUserInfo,
+    TokenRefreshRequest,
+    TokenRefreshResponse,
+    UserLogin,
+    UserLoginResponse,
+)
+from app.utils.jwt_tools import create_access_token_from_refresh_token, create_login_tokens, decode_token
 from app.utils.string_tools import verify_password
 from app.middlewares import common
 
@@ -368,6 +375,54 @@ class UserView(BaseView):
                 username=user.username,
                 nickname=user.nickname,
             ),
+        )
+
+    @route(
+        "/refresh-token",
+        methods=["POST"],
+        response_model=TokenRefreshResponse,
+        middlewares=[Depends(common.request_duration_middleware)],
+        summary="刷新 access token",
+        description="使用有效的 refresh token 换取新的 access token；该接口不要求携带 access token。",
+    )
+    async def refresh_access_token(
+        self,
+        data: TokenRefreshRequest,
+        session: SessionDep,
+    ) -> TokenRefreshResponse:
+        """使用 refresh token 签发新的 access token。
+
+        Args:
+            data: 刷新请求体，包含 refresh token。
+            session: 当前数据库会话依赖。
+
+        Returns:
+            TokenRefreshResponse: 新的 access token 及其有效期。
+
+        Raises:
+            HTTPException: refresh token 无效、已过期或已吊销，或用户已不可用时抛出。
+        """
+        invalid_refresh_token = HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="refresh token 无效或已过期",
+        )
+        try:
+            payload = await decode_token(data.refresh_token)
+            if payload.get("type") != "refresh":
+                raise invalid_refresh_token
+
+            # 刷新前确认用户仍存在且未被禁用，避免已禁用用户持续换取 access token。
+            user = await user_service.get_user_by_public_id(session, str(payload.get("sub", "")))
+            if user is None or user.is_disabled:
+                raise invalid_refresh_token
+
+            tokens = await create_access_token_from_refresh_token(data.refresh_token)
+        except (jwt.PyJWTError, ValueError) as exc:
+            raise invalid_refresh_token from exc
+
+        return TokenRefreshResponse(
+            access_token=str(tokens["access_token"]),
+            expires_in=int(tokens["expires_in"]),
         )
 
 

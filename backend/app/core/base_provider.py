@@ -27,87 +27,6 @@ PROVIDER_CONFIG_NAME = "PROVIDER_CONFIG"
 PROVIDER_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _PROVIDER_FILE_LOCK = threading.RLock()
 _FALLBACK_SECRET_KEYS = {"apikey", "api_key", "token", "secret", "password"}
-_KLINGAI_VIDEO_ASPECT_RATIOS = ["16:9", "9:16", "1:1"]
-_KLINGAI_VIDEO_MODEL_SPECS: list[tuple[str, str, list[str], list[int], list[str]]] = [
-    (
-        "kling-video-o1",
-        "可灵视频 O1 模型，支持文生视频、图生视频与视频参考能力。",
-        ["std", "pro"],
-        list(range(3, 11)),
-        ["720p", "1080p"],
-    ),
-    (
-        "kling-v3-omni",
-        "可灵 3.0 Omni 视频模型，支持文生视频、图生视频、多镜头与 4K 模式。",
-        ["std", "pro", "4k"],
-        list(range(3, 16)),
-        ["720p", "1080p", "4k"],
-    ),
-    (
-        "kling-v3",
-        "可灵 3.0 视频模型，支持文生视频、图生视频、多镜头与 4K 模式。",
-        ["std", "pro", "4k"],
-        list(range(3, 16)),
-        ["720p", "1080p", "4k"],
-    ),
-    (
-        "kling-v2-6",
-        "可灵 2.6 视频模型，支持文生视频、图生视频与声音控制能力。",
-        ["std", "pro"],
-        list(range(3, 16)),
-        ["720p", "1080p"],
-    ),
-    (
-        "kling-v2-5-turbo",
-        "可灵 2.5 Turbo 视频模型，支持文生视频、图生视频。",
-        ["std", "pro"],
-        [5, 10],
-        ["720p", "1080p"],
-    ),
-    (
-        "kling-v2-1-master",
-        "可灵 2.1 Master 视频模型，支持文生视频、图生视频。",
-        ["std"],
-        [5, 10],
-        ["1080p"],
-    ),
-    (
-        "kling-v2-1",
-        "可灵 2.1 视频模型，支持图生视频。",
-        ["std", "pro"],
-        [5, 10],
-        ["720p", "1080p"],
-    ),
-    (
-        "kling-v2-master",
-        "可灵 2.0 Master 视频模型，支持文生视频、图生视频。",
-        ["std"],
-        [5, 10],
-        ["1080p"],
-    ),
-    (
-        "kling-v1-6",
-        "可灵 1.6 视频模型，支持文生视频、图生视频与多图参考能力。",
-        ["std", "pro"],
-        [5, 10],
-        ["720p", "1080p"],
-    ),
-    (
-        "kling-v1-5",
-        "可灵 1.5 视频模型，支持图生视频、首尾帧与运镜控制。",
-        ["std", "pro"],
-        [5, 10],
-        ["720p", "1080p"],
-    ),
-    (
-        "kling-v1",
-        "可灵 1.0 视频模型，支持文生视频、图生视频与运镜控制。",
-        ["std", "pro"],
-        [5, 10],
-        ["720p", "1080p"],
-    ),
-]
-
 
 class ProviderServiceError(Exception):
     """服务配置管理基础异常。"""
@@ -115,7 +34,6 @@ class ProviderServiceError(Exception):
 
 class ProviderNotFoundError(ProviderServiceError):
     """服务文件不存在。"""
-
 
 class ProviderConflictError(ProviderServiceError):
     """服务文件已存在。"""
@@ -294,38 +212,7 @@ async def fetch_provider_models(
 
 def _builtin_provider_models(config: ProviderConfig) -> list[ProviderModel] | None:
     provider_marker = {config.key.lower(), config.protocol.lower()}
-    if "klingai" in provider_marker:
-        return [_build_klingai_video_model(*spec) for spec in _KLINGAI_VIDEO_MODEL_SPECS]
-    return None
-
-
-def _build_klingai_video_model(
-    model_id: str,
-    description: str,
-    modes: list[str],
-    durations: list[int],
-    resolutions: list[str],
-) -> ProviderModel:
-    return ProviderModel(
-        name=model_id,
-        model_id=model_id,
-        model_type="video",
-        description=description,
-        modes=modes,
-        think=False,
-        voices=[],
-        audio="off",
-        duration_resolution_map=[{"duration": durations, "resolution": resolutions}],
-        aspect_ratios=_KLINGAI_VIDEO_ASPECT_RATIOS,
-        sizes=[],
-        fps=[],
-        raw_config={
-            "id": model_id,
-            "object": "model",
-            "owned_by": "klingai",
-            "source": "klingai_document_api",
-        },
-    )
+    return provider_marker
 
 
 def _replace_provider_config_in_source(source: str, path: Path, config: ProviderConfig) -> str:

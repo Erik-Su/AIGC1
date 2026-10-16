@@ -112,7 +112,7 @@ async def create_login_tokens(public_id: str, username: str) -> dict[str, str | 
     }
 
 
-async def decode_token(token: str, *, refresh_access_ttl: bool = False) -> dict[str, str | int]:
+async def decode_token(token: str) -> dict[str, str | int]:
     """解析并校验 JWT。
 
     Args:
@@ -129,9 +129,6 @@ async def decode_token(token: str, *, refresh_access_ttl: bool = False) -> dict[
 
     if not jti or await redis_client.get(cache_key) is None:
         raise ValueError("Token has been revoked")
-
-    if refresh_access_ttl and payload.get("type") == "access":
-        await redis_client.expire(cache_key, settings.access_token_expire_seconds)
 
     return payload
 
