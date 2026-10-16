@@ -49,6 +49,7 @@ export interface ProjectMemberRecord {
   id: number
   project_id: number
   user_public_id: string
+  user_email: string | null
   role: ProjectMemberRole
   joined_at: string
 }

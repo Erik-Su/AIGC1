@@ -58,6 +58,7 @@ class ProjectMemberRead(BaseModel):
     id: int
     project_id: int
     user_public_id: str
+    user_email: str | None
     role: ProjectMemberRole
     joined_at: datetime
 

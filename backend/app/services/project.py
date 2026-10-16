@@ -6,7 +6,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.models.project import Project, ProjectMember, ProjectMemberRole
 from app.models.user import User
-from app.schemas.project import ProjectCreate, ProjectUpdate
+from app.schemas.project import ProjectCreate, ProjectUpdate, ProjectMemberRead
 from app.utils.time_tools import utc_now
 
 
@@ -300,12 +300,20 @@ async def list_project_members(
     session: AsyncSession,
     project_public_id: str,
     current_user_public_id: str,
-) -> list[ProjectMember]:
-    """按项目公开 ID 获取项目成员列表。"""
+) -> list[ProjectMemberRead]:
+    """按项目公开 ID 获取项目成员列表，并附带成员邮箱。"""
     project = await get_project_or_raise(session, project_public_id, current_user_public_id)
     if project.id is None:
         raise ProjectNotFoundError("Project not found")
-    return await _list_project_members_by_project_id(session, project.id)
+
+    statement = (
+        select(ProjectMember, User.email)
+        .join(User, User.public_id == ProjectMember.user_public_id, isouter=True)
+        .where(ProjectMember.project_id == project.id)
+        .order_by(ProjectMember.id)
+    )
+    result = await session.exec(statement)
+    return [_to_member_read(member, email) for member, email in result.all()]
 
 
 async def add_project_member(
@@ -314,7 +322,7 @@ async def add_project_member(
     user_public_id: str,
     role: ProjectMemberRole,
     current_user_public_id: str,
-) -> ProjectMember:
+) -> ProjectMemberRead:
     """新增项目成员。"""
     project = await get_project_or_raise(session, project_public_id, current_user_public_id)
     if project.id is None:
@@ -333,7 +341,7 @@ async def add_project_member(
     session.add(member)
     await session.commit()
     await session.refresh(member)
-    return member
+    return await _member_to_read(session, member)
 
 
 async def invite_project_member(
@@ -342,7 +350,7 @@ async def invite_project_member(
     user_public_id: str,
     role: ProjectMemberRole,
     current_user_public_id: str,
-) -> ProjectMember:
+) -> ProjectMemberRead:
     """邀请用户加入项目。"""
     await _get_user_by_public_id_or_raise(session, user_public_id)
     return await add_project_member(
@@ -360,7 +368,7 @@ async def update_project_member_role(
     user_public_id: str,
     role: ProjectMemberRole,
     current_user_public_id: str,
-) -> ProjectMember:
+) -> ProjectMemberRead:
     """更新项目成员角色。"""
     project = await get_project_or_raise(session, project_public_id, current_user_public_id)
     if project.id is None:
@@ -376,7 +384,7 @@ async def update_project_member_role(
     session.add(member)
     await session.commit()
     await session.refresh(member)
-    return member
+    return await _member_to_read(session, member)
 
 
 async def remove_project_member(
@@ -398,6 +406,24 @@ async def remove_project_member(
     )
     await session.delete(member)
     await session.commit()
+
+
+def _to_member_read(member: ProjectMember, email: str | None) -> ProjectMemberRead:
+    """把成员关系与用户邮箱组装为成员响应模型。"""
+    return ProjectMemberRead(
+        id=member.id,
+        project_id=member.project_id,
+        user_public_id=member.user_public_id,
+        user_email=email,
+        role=member.role,
+        joined_at=member.joined_at,
+    )
+
+
+async def _member_to_read(session: AsyncSession, member: ProjectMember) -> ProjectMemberRead:
+    """查询成员对应用户的邮箱并组装响应模型。"""
+    user = await _get_user_by_public_id_or_raise(session, member.user_public_id)
+    return _to_member_read(member, user.email)
 
 
 async def _list_project_members_by_project_id(

@@ -48,3 +48,6 @@ data/skills
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+#CLAUDE提示词
+CLAUDE.md
