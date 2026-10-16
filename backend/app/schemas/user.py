@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 class UserBase(BaseModel):
@@ -40,7 +40,6 @@ class UserUpdate(BaseModel):
     is_superuser: bool | None = None
     disabled_at: datetime | None = None
 
-
 class UserRead(BaseModel):
     """用户响应模型。"""
 
@@ -58,6 +57,7 @@ class UserRead(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+
 class UserLogin(BaseModel):
     """用户登录请求。"""
     username: str = Field(min_length=1, max_length=50, description="用户名")
@@ -65,7 +65,7 @@ class UserLogin(BaseModel):
 
 
 class LoginUserInfo(BaseModel):
-    """登录成功后返回的用户信息。"""
+    """登录成功后返回的用户详细信息。"""
 
     public_id: str
     username: str
@@ -79,3 +79,53 @@ class UserLoginResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
     user: LoginUserInfo
+
+
+class UserProfileUpdate(BaseModel):
+    """当前登录用户资料更新请求模型。"""
+
+    username: str | None = Field(default=None, min_length=3, max_length=64)
+    nickname: str | None = Field(default=None, max_length=64)
+    email: str | None = Field(default=None, max_length=255)
+
+
+class UserPasswordUpdate(BaseModel):
+    """当前登录用户密码更新请求模型。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    old_password: str = Field(
+        min_length=6,
+        max_length=128,
+        validation_alias=AliasChoices("old_password", "oldPassword"),
+    )
+    new_password: str = Field(
+        min_length=8,
+        max_length=128,
+        validation_alias=AliasChoices("new_password", "newPassword"),
+    )
+    confirm_password: str = Field(
+        min_length=8,
+        max_length=128,
+        validation_alias=AliasChoices("confirm_password", "confirmPassword"),
+    )
+
+    @model_validator(mode="after")
+    def validate_new_password(self) -> "UserPasswordUpdate":
+        if self.new_password != self.confirm_password:
+            raise ValueError("两次输入的密码不一致")
+        if self.old_password == self.new_password:
+            raise ValueError("新密码不能与当前密码相同")
+        return self
+
+
+class UserAvatarUpdate(BaseModel):
+    """当前登录用户头像更新请求模型。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    avatar_url: str | None = Field(
+        default=None,
+        max_length=512,
+        validation_alias=AliasChoices("avatar_url", "avatarUrl"),
+    )
