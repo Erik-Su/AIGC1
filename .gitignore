@@ -141,3 +141,4 @@ cython_debug/
 docker/*/data
 data/skills
 data/models/
+data/chroma/
