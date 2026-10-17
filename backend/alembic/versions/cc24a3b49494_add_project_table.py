@@ -1,8 +1,8 @@
-"""create project table
+"""add project table
 
-Revision ID: 5596639b1e8a
+Revision ID: cc24a3b49494
 Revises: d944f6722bdb
-Create Date: 2026-10-14 13:43:44.491158
+Create Date: 2026-10-16 23:59:57.882202
 
 """
 from typing import Sequence, Union
@@ -10,9 +10,10 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+import sqlmodel
 
 # revision identifiers, used by Alembic.
-revision: str = '5596639b1e8a'
+revision: str = 'cc24a3b49494'
 down_revision: Union[str, Sequence[str], None] = 'd944f6722bdb'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -29,16 +30,18 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('disabled_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('name', sa.String(length=100), nullable=False),
-    sa.Column('intro', sa.String(length=2000), nullable=False),
-    sa.Column('project_type', sa.String(length=50), nullable=False),
-    sa.Column('content_type', sa.String(length=50), nullable=False),
-    sa.Column('art_style', sa.String(length=100), nullable=False),
-    sa.Column('director_manual', sa.String(length=4000), nullable=False),
-    sa.Column('video_ratio', sa.String(length=20), nullable=False),
-    sa.Column('image_model', sa.String(length=100), nullable=False),
-    sa.Column('video_model', sa.String(length=100), nullable=False),
-    sa.Column('image_quality', sa.String(length=50), nullable=False),
-    sa.Column('mode', sa.Enum('text', 'singleImage', 'startEndRequired', 'endFrameOptional', 'startFrameOptional', name='project_video_mode', native_enum=False, create_constraint=True, length=50), nullable=False),
+    sa.Column('intro', sa.String(length=2000), server_default='', nullable=False),
+    sa.Column('project_type', sa.String(length=50), server_default='novel_to_video', nullable=False),
+    sa.Column('content_type', sa.String(length=50), server_default='novel', nullable=False),
+    sa.Column('art_style', sa.String(length=100), server_default='3D_chinese_traditional', nullable=False),
+    sa.Column('director_manual', sa.String(length=4000), server_default='', nullable=False),
+    sa.Column('video_ratio', sa.String(length=20), server_default='9:16', nullable=False),
+    sa.Column('text_model', sa.String(length=100), server_default='', nullable=False),
+    sa.Column('image_model', sa.String(length=100), server_default='', nullable=False),
+    sa.Column('video_model', sa.String(length=100), server_default='', nullable=False),
+    sa.Column('tts_model', sa.String(length=100), server_default='', nullable=False),
+    sa.Column('image_quality', sa.String(length=50), server_default='standard', nullable=False),
+    sa.Column('mode', sa.Enum('text', 'singleImage', 'multiReference', 'startEndRequired', 'endFrameOptional', 'startFrameOptional', name='project_video_mode', native_enum=False, create_constraint=True, length=50), server_default='text', nullable=False),
     sa.Column('owner_id', sa.String(length=36), nullable=False),
     sa.ForeignKeyConstraint(['owner_id'], ['af_user.public_id'], ),
     sa.PrimaryKeyConstraint('id')
@@ -52,8 +55,8 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('project_id', sa.Integer(), nullable=False),
     sa.Column('user_public_id', sa.String(length=36), nullable=False),
-    sa.Column('role', sa.Enum('owner', 'admin', 'manager', 'editor', 'viewer', name='project_member_role', native_enum=False, create_constraint=True, length=20), nullable=False),
-    sa.Column('joined_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('role', sa.Enum('owner', 'admin', 'manager', 'editor', 'viewer', name='project_member_role', native_enum=False, create_constraint=True, length=20), server_default='viewer', nullable=False),
+    sa.Column('joined_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['project_id'], ['af_project.id'], ),
     sa.ForeignKeyConstraint(['user_public_id'], ['af_user.public_id'], ),
     sa.PrimaryKeyConstraint('id')
