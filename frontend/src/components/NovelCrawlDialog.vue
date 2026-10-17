@@ -544,8 +544,8 @@
           description="尚无搜索结果，输入关键词后点击搜索"
         />
         <div
-          v-for="book in crawlResults"
-          :key="book.id"
+          v-for="(book, bookIndex) in crawlResults"
+          :key="`${crawlBookIdentity(book)}#${bookIndex}`"
           class="crawl-book-card"
           :class="{ 'is-active': isSelectedCrawlBook(book) }"
           @click="selectCrawlBook(book)"
@@ -781,7 +781,7 @@
         @selection-change="onCrawlSelectionChange"
       >
         <el-table-column type="selection" width="48" />
-        <el-table-column prop="chapterid" label="章节号" width="96" sortable />
+        <el-table-column prop="key" label="章节号" width="96" sortable />
         <el-table-column prop="chaptername" label="章节标题" min-width="220" sortable>
           <template #default="{ row }">
             <span
@@ -919,7 +919,7 @@
     <div v-if="crawlPreviewChapter" class="crawl-preview">
       <div class="crawl-preview__top">
         <div class="crawl-preview__meta">
-          <span>章节 ID：{{ crawlPreviewChapter.chapterid }}</span>
+          <span>章节号：{{ crawlPreviewChapter.key }}</span>
           <span>字数：{{ crawlPreviewChapter.txt.length }}</span>
           <span>事件状态：{{ crawlEventStateLabel(crawlPreviewChapter.eventState) }}</span>
         </div>
@@ -1296,17 +1296,17 @@ const crawlCompleted = computed(
 )
 
 const nextCrawlStartChapter = computed(() => {
-  const fetchedKeys = new Set(
-    crawledChapters.value
-      .map((item) => item.key)
-      .filter((key) => key >= crawlStartChapter.value && key <= crawlEndChapter.value),
-  )
-  for (let chapter = crawlStartChapter.value; chapter <= crawlEndChapter.value; chapter += 1) {
-    if (!fetchedKeys.has(chapter)) {
-      return chapter
+  let maxFetchedKey = crawlStartChapter.value - 1
+  for (const item of crawledChapters.value) {
+    if (
+      item.key >= crawlStartChapter.value
+      && item.key <= crawlEndChapter.value
+      && item.key > maxFetchedKey
+    ) {
+      maxFetchedKey = item.key
     }
   }
-  return crawlEndChapter.value + 1
+  return Math.min(maxFetchedKey + 1, crawlEndChapter.value + 1)
 })
 
 const canContinueCrawl = computed(
@@ -1418,11 +1418,8 @@ const searchCrawlBooks = async (options: { skipCache?: boolean } = {}) => {
     if (!options.skipCache) {
       const cached = crawlCache.readSearch(props.projectPublicId, sourceKey, query)
       if (cached && cached.length > 0) {
-        crawlResults.value = cached.map((book) => ({
-          ...book,
-          sourceKey: book.sourceKey || sourceKey,
-        }))
-        ElMessage.success(`已使用本地缓存（共 ${cached.length} 条），点「清空缓存」可重新搜索`)
+        crawlResults.value = mergeCrawlSearchResults(cached, sourceKey)
+        ElMessage.success(`已使用本地缓存（共 ${crawlResults.value.length} 条），点「清空缓存」可重新搜索`)
         return
       }
     }
@@ -1430,10 +1427,7 @@ const searchCrawlBooks = async (options: { skipCache?: boolean } = {}) => {
       sourceKey,
       query,
     })
-    crawlResults.value = data.map((book) => ({
-      ...book,
-      sourceKey: book.sourceKey || sourceKey,
-    }))
+    crawlResults.value = mergeCrawlSearchResults(data, sourceKey)
     if (crawlResults.value.length === 0) {
       ElMessage.info('未搜索到可爬取小说')
     } else {
@@ -1505,10 +1499,35 @@ const markCrawlBookDetailsLoaded = (book: CrawlSearchResult) => {
 }
 
 const latestCrawlBook = (book: CrawlSearchResult) => {
+  // 优先对象引用：用户点击哪张卡片就锁定哪张，避免 find 误命中前序同书项
+  if (crawlResults.value.includes(book)) {
+    return book
+  }
   if (crawlSelectedBook.value && isSameCrawlBook(crawlSelectedBook.value, book)) {
     return crawlSelectedBook.value
   }
   return crawlResults.value.find((item) => isSameCrawlBook(item, book)) || book
+}
+
+// 同 sourceKey + dirid（或 id）的搜索记录合并为单条，保留各字段最佳值
+const mergeCrawlSearchResults = (
+  books: CrawlSearchResult[],
+  fallbackSourceKey: string,
+): CrawlSearchResult[] => {
+  const merged: CrawlSearchResult[] = []
+  for (const book of books) {
+    const normalized: CrawlSearchResult = {
+      ...book,
+      sourceKey: book.sourceKey || fallbackSourceKey,
+    }
+    const existing = merged.find((item) => isSameCrawlBook(item, normalized))
+    if (existing) {
+      Object.assign(existing, mergeCrawlBook(existing, normalized, fallbackSourceKey))
+      continue
+    }
+    merged.push(normalized)
+  }
+  return merged
 }
 
 const mergeCrawlBook = (
@@ -1525,7 +1544,7 @@ const mergeCrawlBook = (
     author: pickText(incoming.author, base.author),
     cover: pickText(incoming.cover, base.cover),
     lastchapter: pickText(incoming.lastchapter, base.lastchapter),
-    lastchapterid: incoming.lastchapterid > 0 ? incoming.lastchapterid : base.lastchapterid,
+    lastchapterid: base.lastchapterid > 0 ? base.lastchapterid : incoming.lastchapterid,
     lastupdate: pickText(incoming.lastupdate, base.lastupdate),
     sortname: pickText(incoming.sortname, base.sortname),
     intro: pickText(incoming.intro, base.intro),
@@ -1544,7 +1563,7 @@ const updateCrawlBookInResults = (book: CrawlSearchResult, options: { select?: b
 }
 
 const fetchSelectedBookDetail = async (book: CrawlSearchResult) => {
-  if (!book.dirid || !crawlSourceKey.value) return
+  if ((!book.dirid && !(book.id > 0)) || !crawlSourceKey.value) return
   const requestId = ++crawlBookDetailRequestId
   crawlBookDetailLoading.value = true
   try {
@@ -1557,12 +1576,6 @@ const fetchSelectedBookDetail = async (book: CrawlSearchResult) => {
     const shouldUpdateSelection = isSelectedCrawlBook(book)
     markCrawlBookDetailsLoaded(nextBook)
     updateCrawlBookInResults(nextBook, { select: shouldUpdateSelection })
-    if (shouldUpdateSelection && nextBook.lastchapterid > 0 && crawlEndChapter.value === 20) {
-      crawlEndChapter.value = nextBook.lastchapterid
-    }
-    if (nextBook.lastchapterid <= 0 && !crawlBookCountLoading.value) {
-      void fetchSelectedBookChapterCount(nextBook)
-    }
   } catch (error) {
     if (requestId !== crawlBookDetailRequestId) return
     ElMessage.warning(`详情获取失败：${getErrorMessage(error)}`)
@@ -1574,7 +1587,7 @@ const fetchSelectedBookDetail = async (book: CrawlSearchResult) => {
 }
 
 const fetchSelectedBookChapterCount = async (book: CrawlSearchResult) => {
-  if (book.lastchapterid > 0 || !book.dirid || !crawlSourceKey.value) return
+  if ((!book.dirid && !(book.id > 0)) || !crawlSourceKey.value) return
   const requestId = ++crawlBookCountRequestId
   crawlBookCountLoading.value = true
   try {
@@ -1608,7 +1621,7 @@ const selectCrawlBook = (book: CrawlSearchResult) => {
   const nextBook = latestCrawlBook(book)
   crawlSelectedBook.value = nextBook
   crawlStartChapter.value = 1
-  crawlEndChapter.value = nextBook.lastchapterid > 0 ? nextBook.lastchapterid : 20
+  crawlEndChapter.value = 20
   if (isSwitchingBook) {
     crawledChapters.value = []
     crawlImportSelectedRows.value = []
@@ -1626,6 +1639,9 @@ const selectCrawlBook = (book: CrawlSearchResult) => {
   if (nextBook.lastchapterid > 0) {
     crawlBookCountRequestId += 1
     crawlBookCountLoading.value = false
+    if (crawlEndChapter.value === 20) {
+      crawlEndChapter.value = nextBook.lastchapterid
+    }
   } else {
     void fetchSelectedBookChapterCount(nextBook)
   }
