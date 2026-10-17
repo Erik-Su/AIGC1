@@ -16,3 +16,9 @@ alembic
 redis
 bcrypt
 PyJWT
+
+parsel
+cryptography
+curl_cffi
+playwright
+camoufox==0.4.11

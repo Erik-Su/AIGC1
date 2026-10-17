@@ -26,6 +26,14 @@ const routes = [
     path: '/original',
     component: () => import('@/pages/Original.vue')
   },
+  {
+    path: '/screenwriting',
+    component: () => import('@/pages/Screenwriting.vue')
+  },
+  {
+    path: '/tasks',
+    component: () => import('@/pages/Tasks.vue')
+  },
 ]
 
 

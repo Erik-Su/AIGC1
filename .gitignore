@@ -140,3 +140,4 @@ cython_debug/
 # data
 docker/*/data
 data/skills
+data/models/

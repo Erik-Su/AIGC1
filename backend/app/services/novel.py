@@ -6,6 +6,7 @@ from collections import Counter
 from collections.abc import AsyncIterator
 import json
 import logging
+from typing import Any
 
 from sqlalchemy import func, or_
 from sqlmodel import select
@@ -48,6 +49,8 @@ from app.schemas.novel import (
     NovelChapterRead,
     NovelChapterUpdate,
     NovelImportSplitRule,
+    ScreenwritingPreflightCheck,
+    ScreenwritingPreflightResult,
 )
 from app.schemas.tasks import TaskItemCreate, TaskItemRead, TaskJobCreate, TaskJobDetail
 from app.services.agent_gateway import ProviderModelGateway
@@ -120,6 +123,8 @@ SINGLE_CHAPTER_CLEAN_MAX_CONCURRENCY = 3
 NOVEL_CHAPTER_CLEAN_TASK_TYPE = "novel.chapter.clean_event"
 NOVEL_CHAPTER_CLEAN_QUEUE_NAME = "novel"
 BATCH_CLEAN_STREAM_INTERVAL_SECONDS = 2.0
+# 进入剧本创作前，要求事件提取成功的章节数量下限。
+SCREENWRITING_REQUIRED_EVENT_COUNT = 10
 logger = logging.getLogger(__name__)
 _single_chapter_clean_tasks: set[asyncio.Task[None]] = set()
 _single_chapter_clean_semaphore: asyncio.Semaphore | None = None
@@ -144,6 +149,10 @@ class NovelCrawlSourceNotFoundError(NovelServiceError):
 
 class NovelCrawlSourceValidationError(NovelServiceError):
     """小说爬取来源配置或爬取请求不合法。"""
+
+
+def _crawl_error_message(exc: Exception) -> str:
+    return str(exc).strip() or f"爬取请求失败: {exc.__class__.__name__}"
 
 
 async def list_chapters(
@@ -214,6 +223,67 @@ async def list_chapter_clean_statuses(
     project = await _get_project_with_id(session, project_public_id, current_user_public_id)
     chapters = await _list_chapter_models_by_ids(session, project.id, chapter_ids)
     return [_to_clean_status(chapter) for chapter in chapters]
+
+
+async def get_screenwriting_preflight(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+) -> ScreenwritingPreflightResult:
+    """校验当前项目是否满足进入剧本创作的准入条件。
+
+    校验项：
+        1. 项目已配置文本模型；
+        2. 事件提取成功（event_state==1）的章节数达到下限。
+    """
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+
+    text_model = project.text_model.strip()
+    text_model_passed = bool(text_model)
+
+    count_statement = (
+        select(func.count())
+        .select_from(NovelChapter)
+        .where(
+            NovelChapter.project_id == project.id,
+            NovelChapter.event_state == 1,
+        )
+    )
+    count_result = await session.exec(count_statement)
+    event_ready_count = int(count_result.one())
+    required = SCREENWRITING_REQUIRED_EVENT_COUNT
+    event_passed = event_ready_count >= required
+
+    checks = [
+        ScreenwritingPreflightCheck(
+            key="text_model",
+            label="已配置文本模型",
+            passed=text_model_passed,
+            detail=(
+                f"当前文本模型：{text_model}"
+                if text_model_passed
+                else "项目尚未配置文本模型，请先在项目设置中选择文本模型"
+            ),
+        ),
+        ScreenwritingPreflightCheck(
+            key="chapter_events",
+            label=f"已完成至少 {required} 章事件提取",
+            passed=event_passed,
+            detail=(
+                f"已完成事件提取 {event_ready_count} 章"
+                if event_passed
+                else f"已完成事件提取 {event_ready_count} 章，至少需要 {required} 章，请先在小说页清洗章节事件"
+            ),
+        ),
+    ]
+
+    return ScreenwritingPreflightResult(
+        ready=text_model_passed and event_passed,
+        required_event_count=required,
+        event_ready_count=event_ready_count,
+        text_model=text_model,
+        checks=checks,
+    )
 
 
 async def create_chapter(
@@ -507,7 +577,7 @@ async def search_crawl_books(
     try:
         return await novel_crawler.search_books(source, payload.query)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
 
 
 async def fetch_crawl_book_detail(
@@ -522,7 +592,7 @@ async def fetch_crawl_book_detail(
     try:
         book = await novel_crawler.fetch_book_detail(source, payload.book)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
     await _upsert_crawl_book(session, project.id, source.key, book)
     await session.commit()
     return CrawlBookDetailResult(book=book)
@@ -540,7 +610,7 @@ async def fetch_crawl_book_chapter_count(
     try:
         count = await novel_crawler.fetch_chapter_count(source, payload.book)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
     book = payload.book.model_copy(update={"lastchapterid": count, "source_key": payload.source_key})
     await _upsert_crawl_book(session, project.id, source.key, book)
     await session.commit()
@@ -559,7 +629,7 @@ async def fetch_crawl_chapters(
     try:
         return await novel_crawler.fetch_chapters(source, payload.book, payload.start_chapter, payload.end_chapter)
     except Exception as exc:
-        raise NovelCrawlSourceValidationError(str(exc)) from exc
+        raise NovelCrawlSourceValidationError(_crawl_error_message(exc)) from exc
 
 
 async def build_crawl_chapter_stream(
@@ -721,6 +791,25 @@ async def clean_chapter(
     return _to_read(chapter)
 
 
+async def clean_chapter_for_task(
+    session: AsyncSession,
+    project_public_id: str,
+    chapter_id: int,
+    current_user_public_id: str,
+    *,
+    model_id: str = "",
+) -> dict[str, Any]:
+    """清洗异步任务章节事件，并返回可写入任务结果的执行载荷。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    chapter = await _get_chapter_model_or_raise(session, project.id, chapter_id)
+    prompt_trace = await _apply_chapter_event_extraction(chapter, model_id.strip() or project.text_model)
+    chapter.updated_at = utc_now()
+    session.add(chapter)
+    await session.commit()
+    await session.refresh(chapter)
+    return _chapter_clean_task_result(chapter, prompt_trace)
+
+
 async def queue_clean_chapter(
     session: AsyncSession,
     project_public_id: str,
@@ -825,6 +914,9 @@ async def batch_clean_chapters(
         raise NovelChapterValidationError("未找到任何待清洗章节")
 
     now = utc_now()
+    model_id = project.text_model.strip()
+    if not model_id:
+        raise NovelChapterValidationError("项目未配置文本模型，无法提交批量清洗任务")
     items: list[TaskItemCreate] = []
     for chapter in chapters:
         chapter_id = int(chapter.id or 0)
@@ -844,6 +936,7 @@ async def batch_clean_chapters(
                     "chapter_index": chapter.chapter_index,
                     "chapter_title": chapter.chapter,
                     "reel": chapter.reel,
+                    "model_id": model_id,
                     "current_user_public_id": current_user_public_id,
                 },
             )
@@ -860,6 +953,7 @@ async def batch_clean_chapters(
             payload={
                 "project_public_id": project_public_id,
                 "chapter_count": len(chapters),
+                "model_id": model_id,
             },
             items=items,
         ),
@@ -1209,38 +1303,84 @@ async def _next_chapter_index(session: AsyncSession, project_id: int) -> int:
     return int(max_index or 0) + 1
 
 
-async def _apply_chapter_event_extraction(chapter: NovelChapter, text_model: str) -> None:
+async def _apply_chapter_event_extraction(chapter: NovelChapter, text_model: str) -> dict[str, Any]:
     """调用文本模型提取单章事件。"""
     content = chapter.chapter_data.strip()
     if len(content) < MIN_EVENT_EXTRACTION_CONTENT_LENGTH:
         _mark_event_extraction_failed(chapter, "正文字数过少，无法提取有效事件")
-        return
+        return {}
 
     model_id = text_model.strip()
     if not model_id:
         _mark_event_extraction_failed(chapter, "项目未配置文本模型")
-        return
+        return {}
 
+    prompt_trace: dict[str, Any] = {}
     try:
         prompt_name = settings.chapter_event_extraction_prompt_name.strip()
         if not prompt_name:
             raise NovelChapterValidationError("单章事件提取提示词名称未配置")
         prompt = PromptRegistry.from_settings().skill(prompt_name)
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": _chapter_event_user_message(chapter, content)},
+        ]
+        prompt_trace = _model_prompt_trace(
+            model_id=model_id,
+            prompt_name=prompt_name,
+            messages=messages,
+        )
         raw_event = await ProviderModelGateway(timeout=settings.model_request_timeout_seconds).generate_text(
             model_id=model_id,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": _chapter_event_user_message(chapter, content)},
-            ],
+            messages=messages,
         )
+        prompt_trace["raw_output"] = raw_event
         payload = _parse_chapter_event_payload(raw_event)
     except Exception as exc:
         _mark_event_extraction_failed(chapter, str(exc))
-        return
+        return prompt_trace
 
     chapter.event = json.dumps(payload, ensure_ascii=False, indent=2)
     chapter.event_state = 1
     chapter.error_reason = None
+    return prompt_trace
+
+
+def _chapter_clean_task_result(chapter: NovelChapter, prompt_trace: dict[str, Any]) -> dict[str, Any]:
+    """构建写入异步任务 item.result 的章节清洗结果。"""
+    return {
+        "chapter_id": chapter.id,
+        "chapter_public_id": chapter.public_id,
+        "event_state": chapter.event_state,
+        "event": chapter.event,
+        "error_reason": chapter.error_reason,
+        **prompt_trace,
+    }
+
+
+def _model_prompt_trace(
+    *,
+    model_id: str,
+    prompt_name: str,
+    messages: list[dict[str, str]],
+) -> dict[str, Any]:
+    """记录本次模型调用的完整提示词，供异步任务详情排查使用。"""
+    return {
+        "model_id": model_id,
+        "prompt_name": prompt_name,
+        "messages": messages,
+        "composed_prompt": _format_model_messages(messages),
+    }
+
+
+def _format_model_messages(messages: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    for index, message in enumerate(messages, start=1):
+        role = str(message.get("role") or f"message_{index}").strip()
+        content = str(message.get("content") or "").strip()
+        if content:
+            parts.append(f"{role}：\n{content}")
+    return "\n\n".join(parts)
 
 
 def _chapter_event_user_message(chapter: NovelChapter, content: str) -> str:
