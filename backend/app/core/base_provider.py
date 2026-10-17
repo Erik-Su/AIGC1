@@ -35,6 +35,7 @@ class ProviderServiceError(Exception):
 class ProviderNotFoundError(ProviderServiceError):
     """服务文件不存在。"""
 
+
 class ProviderConflictError(ProviderServiceError):
     """服务文件已存在。"""
 
@@ -45,6 +46,38 @@ class ProviderValidationError(ProviderServiceError):
 
 class ProviderRemoteRequestError(ProviderServiceError):
     """请求远端大模型服务失败。"""
+
+
+class ProviderConfigurationError(ProviderServiceError):
+    """Provider 运行配置不完整。"""
+
+
+class BaseProvider:
+    """Provider 运行时基类。"""
+
+    provider_key = ""
+    provider_config: dict[str, Any] = {}
+    model_type = ""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        input_values: dict[str, str] | None = None,
+        timeout: float = 60.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        config_input_values = self.provider_config.get("input_values") or {}
+        self.input_values = {**config_input_values, **(input_values or {})}
+        self.api_key = api_key
+        self.base_url = base_url or str(self.provider_config.get("base_url") or "")
+        self.timeout = timeout
+        self.client = client
+
+    async def generate(self, *, model_id: str | None = None, **kwargs: Any) -> Any:
+        """执行生成任务。"""
+        raise NotImplementedError("请在具体 Provider 中实现生成逻辑")
 
 
 def list_provider_configs(root: Path | None = None) -> list[ProviderConfig]:
@@ -213,7 +246,6 @@ async def fetch_provider_models(
 def _builtin_provider_models(config: ProviderConfig) -> list[ProviderModel] | None:
     provider_marker = {config.key.lower(), config.protocol.lower()}
     return provider_marker
-
 
 def _replace_provider_config_in_source(source: str, path: Path, config: ProviderConfig) -> str:
     node = _find_provider_config_node(source, path)

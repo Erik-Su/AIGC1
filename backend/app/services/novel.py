@@ -1,16 +1,38 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+from collections.abc import AsyncIterator
+import json
+import logging
 
 from sqlalchemy import func, or_
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.models.novel import NovelChapter
+from app.core import database
+from app.core.config import settings
+from app.models.novel import NovelChapter, NovelCrawlBook, NovelCrawlSource
 from app.schemas.novel import (
+    CrawlAnalyzePayload,
+    CrawlAnalyzeResult,
+    CrawlBookChapterCountResult,
+    CrawlBookDetailResult,
+    CrawlBookPayload,
+    CrawlChapterDraft,
+    CrawlChapterFetchPayload,
+    CrawlImportPayload,
+    CrawlImportResult,
+    CrawlSearchPayload,
+    CrawlSearchResult,
+    CrawlSourceDuplicate,
+    CrawlSourcePayload,
+    CrawlSourceRead,
+    CrawlSourceUpdate,
     NovelChapterBatchClean,
     NovelChapterBatchDelete,
     NovelChapterBatchResult,
+    NovelChapterCleanStatus,
     NovelChapterCreate,
     NovelChapterEventStateUpdate,
     NovelChapterImport,
@@ -19,10 +41,76 @@ from app.schemas.novel import (
     NovelChapterUpdate,
     NovelImportSplitRule,
 )
+from app.services.agent_gateway import ProviderModelGateway
+from app.services.prompt_registry import PromptRegistry
+from app.services import novel_crawler
 from app.services import project as project_service
 from app.utils.novel_import_rules import get_builtin_import_split_rules
 from app.utils.novel_parser import ParsedNovelChapter, parse_novel_chapters
 from app.utils.time_tools import utc_now
+
+
+CRAWL_SOURCE_CONFIG_FIELDS = (
+    "name",
+    "base_url",
+    "desc",
+    "source_type",
+    "search_url_template",
+    "api_search_method",
+    "api_search_headers",
+    "api_search_body",
+    "api_search_book_url_path",
+    "api_search_book_id_path",
+    "api_search_book_title_path",
+    "api_search_book_author_path",
+    "api_search_book_intro_path",
+    "api_search_book_cover_path",
+    "api_search_book_category_path",
+    "api_search_book_update_status_path",
+    "api_search_book_last_chapter_path",
+    "api_search_book_last_chapter_id_path",
+    "api_search_book_last_update_path",
+    "api_book_url",
+    "api_book_method",
+    "api_book_headers",
+    "api_book_body",
+    "api_book_title_path",
+    "api_book_author_path",
+    "api_book_intro_path",
+    "api_book_last_chapter_path",
+    "api_book_last_chapter_id_path",
+    "api_book_last_update_path",
+    "api_book_cover_path",
+    "api_book_category_path",
+    "api_book_update_status_path",
+    "api_book_id_path",
+    "api_chapter_list_url",
+    "api_chapter_list_method",
+    "api_chapter_list_headers",
+    "api_chapter_list_body",
+    "api_chapter_list_id_path",
+    "api_chapter_list_name_path",
+    "api_chapter_list_time_path",
+    "api_chapter_list_content_path",
+    "api_chapter_list_md5_path",
+    "api_chapter_url",
+    "api_chapter_method",
+    "api_chapter_headers",
+    "api_chapter_body",
+    "api_chapter_name_path",
+    "api_chapter_content_path",
+    "api_chapter_time_path",
+    "api_chapter_md5_path",
+)
+
+# 要求单章字数必须长度在800以上才会交给大模型。
+MIN_EVENT_EXTRACTION_CONTENT_LENGTH = 300
+# 单章事件清晰的并发数量（设置最多允许多少个清洗任务同时执行，默认设为3）
+SINGLE_CHAPTER_CLEAN_MAX_CONCURRENCY = 3
+logger = logging.getLogger(__name__)
+_single_chapter_clean_tasks: set[asyncio.Task[None]] = set()
+_single_chapter_clean_semaphore: asyncio.Semaphore | None = None
+_single_chapter_clean_semaphore_loop: asyncio.AbstractEventLoop | None = None
 
 
 class NovelServiceError(Exception):
@@ -35,6 +123,14 @@ class NovelChapterNotFoundError(NovelServiceError):
 
 class NovelChapterValidationError(NovelServiceError):
     """小说章节请求不合法。"""
+
+
+class NovelCrawlSourceNotFoundError(NovelServiceError):
+    """小说爬取来源不存在，或当前项目不可见。"""
+
+
+class NovelCrawlSourceValidationError(NovelServiceError):
+    """小说爬取来源配置或爬取请求不合法。"""
 
 
 async def list_chapters(
@@ -91,6 +187,20 @@ async def get_chapter(
     project = await _get_project_with_id(session, project_public_id, current_user_public_id)
     chapter = await _get_chapter_model_or_raise(session, project.id, chapter_id)
     return _to_read(chapter)
+
+
+async def list_chapter_clean_statuses(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    chapter_ids: list[int],
+) -> list[NovelChapterCleanStatus]:
+    """批量获取章节事件清洗状态，不返回章节正文。"""
+    if not chapter_ids:
+        raise NovelChapterValidationError("请选择要查询的章节")
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    chapters = await _list_chapter_models_by_ids(session, project.id, chapter_ids)
+    return [_to_clean_status(chapter) for chapter in chapters]
 
 
 async def create_chapter(
@@ -226,7 +336,7 @@ async def import_chapters(
 
 
 def list_import_split_rules() -> list[NovelImportSplitRule]:
-    """Return built-in frontend import split rules."""
+    """返回前端导入弹窗使用的内置章节切分规则。"""
     return [
         NovelImportSplitRule(
             key=rule.key,
@@ -242,8 +352,326 @@ def list_import_split_rules() -> list[NovelImportSplitRule]:
     ]
 
 
+async def list_crawl_sources(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+) -> list[CrawlSourceRead]:
+    """列出当前项目可见的公共来源和项目私有来源。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    statement = (
+        select(NovelCrawlSource)
+        .where(
+            NovelCrawlSource.disabled_at.is_(None),
+            or_(NovelCrawlSource.scope == "public", NovelCrawlSource.project_id == project.id),
+        )
+        .order_by(NovelCrawlSource.sort_order, NovelCrawlSource.id)
+    )
+    result = await session.exec(statement)
+    return [_to_crawl_source_read(source, project_public_id if source.project_id == project.id else None) for source in result.all()]
+
+
+async def create_crawl_source(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlSourcePayload,
+) -> CrawlSourceRead:
+    """创建项目私有的 API 小说爬取来源。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    await _ensure_crawl_source_key_available(session, payload.key)
+    now = utc_now()
+    source = NovelCrawlSource(
+        project_id=project.id,
+        owner_public_id=current_user_public_id,
+        key=payload.key.strip(),
+        builtin=False,
+        scope="private",
+        created_at=now,
+        updated_at=now,
+    )
+    _apply_crawl_source_values(source, payload.model_dump())
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+    return _to_crawl_source_read(source, project_public_id)
+
+
+async def update_crawl_source(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    key: str,
+    payload: CrawlSourceUpdate,
+) -> CrawlSourceRead:
+    """更新项目私有的小说爬取来源。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_project_crawl_source_or_raise(session, project.id, key)
+    _apply_crawl_source_values(source, payload.model_dump(exclude_unset=True))
+    source.updated_at = utc_now()
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+    return _to_crawl_source_read(source, project_public_id)
+
+
+async def delete_crawl_source(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    key: str,
+) -> None:
+    """删除项目私有的小说爬取来源。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_project_crawl_source_or_raise(session, project.id, key)
+    await session.delete(source)
+    await session.commit()
+
+
+async def duplicate_crawl_source(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    key: str,
+    payload: CrawlSourceDuplicate,
+) -> CrawlSourceRead:
+    """把可见来源复制到当前项目。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    origin = await _get_visible_crawl_source_or_raise(session, project.id, key)
+    await _ensure_crawl_source_key_available(session, payload.new_key)
+    now = utc_now()
+    source = NovelCrawlSource(
+        project_id=project.id,
+        owner_public_id=current_user_public_id,
+        key=payload.new_key.strip(),
+        builtin=False,
+        scope="private",
+        created_at=now,
+        updated_at=now,
+    )
+    values = {field: getattr(origin, field) for field in CRAWL_SOURCE_CONFIG_FIELDS}
+    if payload.name:
+        values["name"] = payload.name
+    _apply_crawl_source_values(source, values)
+    session.add(source)
+    await session.commit()
+    await session.refresh(source)
+    return _to_crawl_source_read(source, project_public_id)
+
+
+async def analyze_crawl_source(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlAnalyzePayload,
+) -> CrawlAnalyzeResult:
+    """返回用于手动配置的来源草稿。"""
+    await _get_project_with_id(session, project_public_id, current_user_public_id)
+    return CrawlAnalyzeResult(
+        status="pending",
+        source=CrawlSourcePayload(
+            key="custom_source",
+            name="Custom Source",
+            baseUrl=payload.url,
+            sourceType="api",
+            searchUrlTemplate="",
+            builtin=False,
+            projectPublicId=project_public_id,
+        ),
+        message="Source analysis is not automated yet. Please complete the API paths manually.",
+    )
+
+
+async def search_crawl_books(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlSearchPayload,
+) -> list[CrawlSearchResult]:
+    """通过选中的小说来源搜索小说。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_visible_crawl_source_or_raise(session, project.id, payload.source_key)
+    try:
+        return await novel_crawler.search_books(source, payload.query)
+    except Exception as exc:
+        raise NovelCrawlSourceValidationError(str(exc)) from exc
+
+
+async def fetch_crawl_book_detail(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlBookPayload,
+) -> CrawlBookDetailResult:
+    """获取选中小说详情，并持久化爬取小说快照。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_visible_crawl_source_or_raise(session, project.id, payload.source_key)
+    try:
+        book = await novel_crawler.fetch_book_detail(source, payload.book)
+    except Exception as exc:
+        raise NovelCrawlSourceValidationError(str(exc)) from exc
+    await _upsert_crawl_book(session, project.id, source.key, book)
+    await session.commit()
+    return CrawlBookDetailResult(book=book)
+
+
+async def fetch_crawl_book_chapter_count(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlBookPayload,
+) -> CrawlBookChapterCountResult:
+    """获取选中小说的章节总数。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_visible_crawl_source_or_raise(session, project.id, payload.source_key)
+    try:
+        count = await novel_crawler.fetch_chapter_count(source, payload.book)
+    except Exception as exc:
+        raise NovelCrawlSourceValidationError(str(exc)) from exc
+    book = payload.book.model_copy(update={"lastchapterid": count, "source_key": payload.source_key})
+    await _upsert_crawl_book(session, project.id, source.key, book)
+    await session.commit()
+    return CrawlBookChapterCountResult(book=book, lastchapterid=count)
+
+
+async def fetch_crawl_chapters(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlChapterFetchPayload,
+) -> list[CrawlChapterDraft]:
+    """爬取指定范围内的章节。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_visible_crawl_source_or_raise(session, project.id, payload.source_key)
+    try:
+        return await novel_crawler.fetch_chapters(source, payload.book, payload.start_chapter, payload.end_chapter)
+    except Exception as exc:
+        raise NovelCrawlSourceValidationError(str(exc)) from exc
+
+
+async def build_crawl_chapter_stream(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlChapterFetchPayload,
+) -> AsyncIterator[dict[str, object]]:
+    """创建指定章节范围的爬取进度流。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_visible_crawl_source_or_raise(session, project.id, payload.source_key)
+
+    async def generate() -> AsyncIterator[dict[str, object]]:
+        completed = 0
+        total = max(payload.end_chapter - payload.start_chapter + 1, 0)
+        try:
+            async for event in novel_crawler.stream_chapters(
+                source,
+                payload.book,
+                payload.start_chapter,
+                payload.end_chapter,
+            ):
+                if event.get("type") == "chapter":
+                    completed = int(event.get("completed") or completed)
+                    total = int(event.get("total") or total)
+                yield event
+        except Exception as exc:
+            yield {
+                "type": "error",
+                "detail": str(exc),
+                "completed": completed,
+                "total": total,
+            }
+
+    return generate()
+
+
+async def import_crawl_chapters(
+    session: AsyncSession,
+    project_public_id: str,
+    current_user_public_id: str,
+    payload: CrawlImportPayload,
+) -> CrawlImportResult:
+    """把已爬取章节导入现有小说章节表。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    source = await _get_visible_crawl_source_or_raise(session, project.id, payload.source_key)
+    book = payload.book.model_copy(update={"source_key": source.key})
+    await _upsert_crawl_book(session, project.id, source.key, book)
+
+    start_index = await _next_chapter_index(session, project.id)
+    now = utc_now()
+    created = 0
+    updated = 0
+    skipped = 0
+    touched: list[NovelChapter] = []
+
+    for draft in sorted(payload.chapters, key=lambda item: (item.key, item.chapterid)):
+        chapter_text = draft.txt.strip()
+        chapter_name = draft.chaptername.strip()
+        if not chapter_text or not chapter_name:
+            skipped += 1
+            continue
+        existing = await _get_chapter_by_crawl_identity(
+            session,
+            project.id,
+            source.key,
+            draft.novel_dirid or book.dirid,
+            draft.chapterid,
+        )
+        if existing is not None:
+            if (
+                existing.chapter == chapter_name
+                and existing.chapter_data == chapter_text
+                and existing.event == draft.event.strip()
+                and existing.event_state == draft.event_state
+            ):
+                skipped += 1
+                continue
+            existing.chapter = chapter_name
+            existing.chapter_data = chapter_text
+            existing.event = draft.event.strip()
+            existing.event_state = draft.event_state
+            existing.error_reason = draft.error_reason
+            existing.crawl_time = draft.time.strip()
+            existing.crawl_md5 = draft.md5.strip() or _chapter_content_md5(chapter_text)
+            existing.updated_at = now
+            session.add(existing)
+            touched.append(existing)
+            updated += 1
+            continue
+
+        chapter = NovelChapter(
+            project_id=project.id,
+            chapter_index=start_index + created,
+            reel="",
+            chapter=chapter_name,
+            chapter_data=chapter_text,
+            event=draft.event.strip(),
+            event_state=draft.event_state,
+            error_reason=draft.error_reason,
+            crawl_source_key=source.key,
+            crawl_novel_dirid=(draft.novel_dirid or book.dirid).strip(),
+            crawl_chapter_id=draft.chapterid,
+            crawl_time=draft.time.strip(),
+            crawl_md5=draft.md5.strip() or _chapter_content_md5(chapter_text),
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(chapter)
+        touched.append(chapter)
+        created += 1
+
+    await session.commit()
+    for chapter in touched:
+        await session.refresh(chapter)
+    return CrawlImportResult(
+        created=created,
+        updated=updated,
+        skipped=skipped,
+        chapters=[_to_read(chapter) for chapter in touched],
+    )
+
+
 def _parse_import_payload(payload: NovelChapterImport) -> list[ParsedNovelChapter]:
-    """Return parsed chapters from preview drafts when present, otherwise parse raw text."""
+    """优先返回预览草稿解析结果，否则解析原始文本。"""
     if payload.chapters:
         parsed_chapters: list[ParsedNovelChapter] = []
         for index, item in enumerate(payload.chapters, start=1):
@@ -272,12 +700,103 @@ async def clean_chapter(
     """清洗单个章节事件。"""
     project = await _get_project_with_id(session, project_public_id, current_user_public_id)
     chapter = await _get_chapter_model_or_raise(session, project.id, chapter_id)
-    _apply_clean_result(chapter)
+    await _apply_chapter_event_extraction(chapter, project.text_model)
     chapter.updated_at = utc_now()
     session.add(chapter)
     await session.commit()
     await session.refresh(chapter)
     return _to_read(chapter)
+
+
+async def queue_clean_chapter(
+    session: AsyncSession,
+    project_public_id: str,
+    chapter_id: int,
+    current_user_public_id: str,
+) -> NovelChapterRead:
+    """提交单章事件提取前，将章节重置为待清洗状态。"""
+    project = await _get_project_with_id(session, project_public_id, current_user_public_id)
+    chapter = await _get_chapter_model_or_raise(session, project.id, chapter_id)
+    chapter.event = ""
+    chapter.event_state = 0
+    chapter.error_reason = None
+    chapter.updated_at = utc_now()
+    session.add(chapter)
+    await session.commit()
+    await session.refresh(chapter)
+    return _to_read(chapter)
+
+
+async def clean_chapter_in_background(
+    project_public_id: str,
+    chapter_id: int,
+    current_user_public_id: str,
+) -> None:
+    """在后台任务中使用独立数据库会话清洗单章事件。"""
+    async with database.async_session_maker() as session:
+        try:
+            await clean_chapter(session, project_public_id, chapter_id, current_user_public_id)
+        except Exception:
+            await session.rollback()
+            logger.exception(
+                "后台清洗章节事件失败：project_public_id=%s chapter_id=%s",
+                project_public_id,
+                chapter_id,
+            )
+
+
+def submit_clean_chapter_task(
+    project_public_id: str,
+    chapter_id: int,
+    current_user_public_id: str,
+) -> None:
+    """提交单章事件清洗任务，并允许多个章节在后台并发处理。"""
+    # 把清洗章节任务放后台（无阻塞）异步运行
+    task = asyncio.create_task(
+        _run_submitted_clean_chapter_task(
+            project_public_id,
+            chapter_id,
+            current_user_public_id,
+        )
+    )
+    # 添加任务记录到数据库
+    _single_chapter_clean_tasks.add(task)
+    # 回调函数
+    task.add_done_callback(_discard_single_chapter_clean_task)
+
+
+async def _run_submitted_clean_chapter_task(
+    project_public_id: str,
+    chapter_id: int,
+    current_user_public_id: str,
+) -> None:
+    semaphore = _get_single_chapter_clean_semaphore()
+    async with semaphore:
+        await clean_chapter_in_background(project_public_id, chapter_id, current_user_public_id)
+
+
+def _get_single_chapter_clean_semaphore() -> asyncio.Semaphore:
+    global _single_chapter_clean_semaphore, _single_chapter_clean_semaphore_loop
+
+    loop = asyncio.get_running_loop()
+    if _single_chapter_clean_semaphore is None or _single_chapter_clean_semaphore_loop is not loop:
+        _single_chapter_clean_semaphore = asyncio.Semaphore(SINGLE_CHAPTER_CLEAN_MAX_CONCURRENCY)
+        _single_chapter_clean_semaphore_loop = loop
+    return _single_chapter_clean_semaphore
+
+
+def _discard_single_chapter_clean_task(task: asyncio.Task[None]) -> None:
+    # 把任务结果注册到内存的列表中，后面我们实现批量章节清洗时，会使用Redis/RabbitMQ替代_single_chapter_clean_tasks
+    _single_chapter_clean_tasks.discard(task)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc is not None:
+        logger.error(
+            "单章事件清洗任务异常",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
 
 async def batch_clean_chapters(
@@ -402,6 +921,94 @@ def _apply_clean_result(chapter: NovelChapter) -> None:
     chapter.error_reason = None
 
 
+async def _apply_chapter_event_extraction(chapter: NovelChapter, text_model: str) -> None:
+    """调用文本模型提取单章事件。"""
+    content = chapter.chapter_data.strip()
+    if len(content) < MIN_EVENT_EXTRACTION_CONTENT_LENGTH:
+        _mark_event_extraction_failed(chapter, "正文字数过少，无法提取有效事件")
+        return
+
+    model_id = text_model.strip()
+    if not model_id:
+        _mark_event_extraction_failed(chapter, "项目未配置文本模型")
+        return
+
+    try:
+        prompt_name = settings.chapter_event_extraction_prompt_name.strip()
+        if not prompt_name:
+            raise NovelChapterValidationError("单章事件提取提示词名称未配置")
+        prompt = PromptRegistry.from_settings().skill(prompt_name)
+        raw_event = await ProviderModelGateway(timeout=settings.model_request_timeout_seconds).generate_text(
+            model_id=model_id,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": _chapter_event_user_message(chapter, content)},
+            ],
+        )
+        payload = _parse_chapter_event_payload(raw_event)
+    except Exception as exc:
+        _mark_event_extraction_failed(chapter, str(exc))
+        return
+
+    chapter.event = json.dumps(payload, ensure_ascii=False, indent=2)
+    chapter.event_state = 1
+    chapter.error_reason = None
+
+
+def _chapter_event_user_message(chapter: NovelChapter, content: str) -> str:
+    return (
+        f"章节标题：{chapter.chapter.strip() or '未提及'}\n"
+        f"卷名：{chapter.reel.strip() or '未提及'}\n\n"
+        "章节正文：\n"
+        f"{content}"
+    )
+
+
+def _parse_chapter_event_payload(raw_event: str) -> dict[str, object]:
+    text = _strip_json_code_fence(raw_event)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise NovelChapterValidationError("事件提取结果不是合法 JSON") from exc
+    if not isinstance(payload, dict):
+        raise NovelChapterValidationError("事件提取结果必须是 JSON 对象")
+    if set(payload.keys()) != {"events"}:
+        raise NovelChapterValidationError("事件提取结果顶层只能包含 events 字段")
+    if not isinstance(payload["events"], list):
+        raise NovelChapterValidationError("事件提取结果 events 字段必须是数组")
+    return {"events": payload["events"]}
+
+
+def _strip_json_code_fence(raw_event: str) -> str:
+    text = raw_event.strip()
+    if not text.startswith("```"):
+        return text
+    lines = text.splitlines()
+    if len(lines) >= 3 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text
+
+
+def _mark_event_extraction_failed(chapter: NovelChapter, reason: str) -> None:
+    chapter.event = ""
+    chapter.event_state = -1
+    chapter.error_reason = reason.strip() or "事件提取失败"
+
+
+def _to_clean_status(chapter: NovelChapter) -> NovelChapterCleanStatus:
+    return NovelChapterCleanStatus(
+        id=int(chapter.id or 0),
+        publicId=chapter.public_id,
+        chapterIndex=chapter.chapter_index,
+        reel=chapter.reel,
+        chapter=chapter.chapter,
+        event=chapter.event,
+        eventState=chapter.event_state,
+        errorReason=chapter.error_reason,
+        updatedAt=chapter.updated_at,
+    )
+
+
 def _state_for_event(event: str, requested_state: int) -> int:
     """如果请求携带事件内容，默认认为事件已生成。"""
     if event.strip() and requested_state == 0:
@@ -412,6 +1019,134 @@ def _state_for_event(event: str, requested_state: int) -> int:
 def _chapter_content_md5(chapter_data: str) -> str:
     """按最终保存的章节正文计算内容指纹。"""
     return hashlib.md5(chapter_data.encode("utf-8")).hexdigest()
+
+
+async def _ensure_crawl_source_key_available(session: AsyncSession, key: str) -> None:
+    statement = select(NovelCrawlSource.id).where(NovelCrawlSource.key == key.strip())
+    result = await session.exec(statement)
+    if result.first() is not None:
+        raise NovelCrawlSourceValidationError("Crawl source key already exists")
+
+
+async def _get_visible_crawl_source_or_raise(
+    session: AsyncSession,
+    project_id: int,
+    key: str,
+) -> NovelCrawlSource:
+    statement = select(NovelCrawlSource).where(
+        NovelCrawlSource.key == key.strip(),
+        NovelCrawlSource.disabled_at.is_(None),
+        or_(NovelCrawlSource.scope == "public", NovelCrawlSource.project_id == project_id),
+    )
+    result = await session.exec(statement)
+    source = result.first()
+    if source is None:
+        raise NovelCrawlSourceNotFoundError("Crawl source not found")
+    return source
+
+
+async def _get_project_crawl_source_or_raise(
+    session: AsyncSession,
+    project_id: int,
+    key: str,
+) -> NovelCrawlSource:
+    statement = select(NovelCrawlSource).where(
+        NovelCrawlSource.key == key.strip(),
+        NovelCrawlSource.project_id == project_id,
+        NovelCrawlSource.disabled_at.is_(None),
+    )
+    result = await session.exec(statement)
+    source = result.first()
+    if source is None:
+        raise NovelCrawlSourceNotFoundError("Crawl source not found")
+    return source
+
+
+def _apply_crawl_source_values(source: NovelCrawlSource, values: dict[str, object]) -> None:
+    for field in CRAWL_SOURCE_CONFIG_FIELDS:
+        if field not in values:
+            continue
+        value = values[field]
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+        if field.endswith("_method"):
+            value = str(value or "GET").upper()
+        if field == "source_type":
+            value = str(value or "api").lower()
+        setattr(source, field, value)
+
+
+def _to_crawl_source_read(source: NovelCrawlSource, project_public_id: str | None) -> CrawlSourceRead:
+    return CrawlSourceRead(
+        **{field: getattr(source, field) for field in CRAWL_SOURCE_CONFIG_FIELDS},
+        key=source.key,
+        builtin=source.builtin,
+        projectPublicId=project_public_id,
+        id=int(source.id or 0),
+        publicId=source.public_id,
+        scope=source.scope,
+        sortOrder=source.sort_order,
+        createdAt=source.created_at,
+        updatedAt=source.updated_at,
+        disabledAt=source.disabled_at,
+    )
+
+
+async def _upsert_crawl_book(
+    session: AsyncSession,
+    project_id: int,
+    source_key: str,
+    book: CrawlSearchResult,
+) -> NovelCrawlBook:
+    statement = select(NovelCrawlBook).where(
+        NovelCrawlBook.project_id == project_id,
+        NovelCrawlBook.source_key == source_key,
+        NovelCrawlBook.source_book_id == book.dirid,
+    )
+    result = await session.exec(statement)
+    crawl_book = result.first()
+    now = utc_now()
+    if crawl_book is None:
+        crawl_book = NovelCrawlBook(
+            project_id=project_id,
+            source_key=source_key,
+            source_book_id=book.dirid,
+            created_at=now,
+            updated_at=now,
+        )
+    crawl_book.source_book_numeric_id = book.id or None
+    crawl_book.title = book.title
+    crawl_book.author = book.author
+    crawl_book.cover_url = book.cover
+    crawl_book.category = book.sortname
+    crawl_book.update_status = book.full
+    crawl_book.intro = book.intro
+    crawl_book.last_chapter = book.lastchapter
+    crawl_book.last_chapter_id = book.lastchapterid
+    crawl_book.last_update = book.lastupdate
+    crawl_book.raw_data = json.dumps(book.model_dump(mode="json", by_alias=True), ensure_ascii=False)
+    crawl_book.updated_at = now
+    session.add(crawl_book)
+    return crawl_book
+
+
+async def _get_chapter_by_crawl_identity(
+    session: AsyncSession,
+    project_id: int,
+    source_key: str,
+    novel_dirid: str,
+    chapter_id: int,
+) -> NovelChapter | None:
+    statement = select(NovelChapter).where(
+        NovelChapter.project_id == project_id,
+        NovelChapter.crawl_source_key == source_key,
+        NovelChapter.crawl_novel_dirid == novel_dirid,
+        NovelChapter.crawl_chapter_id == chapter_id,
+    )
+    result = await session.exec(statement)
+    return result.first()
 
 
 def _to_read(chapter: NovelChapter) -> NovelChapterRead:
